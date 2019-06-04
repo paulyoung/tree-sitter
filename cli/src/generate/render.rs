@@ -762,7 +762,7 @@ impl Generator {
         {
             add_line!(self, "[{}] = {{", i);
             indent!(self);
-            for (symbol, state_id) in &state.nonterminal_entries {
+            for (symbol, (state_id, _)) in &state.nonterminal_entries {
                 add_line!(
                     self,
                     "[{}] = STATE({}),",
@@ -829,7 +829,7 @@ impl Generator {
                     add_line!(self, "{}, ACTIONS({}),", self.symbol_ids[symbol], entry_id);
                 }
 
-                for (symbol, state_id) in &nonterminal_entries {
+                for (symbol, (state_id, _)) in &nonterminal_entries {
                     add_line!(self, "{}, STATE({}),", self.symbol_ids[symbol], *state_id);
                 }
                 dedent!(self);
@@ -864,6 +864,7 @@ impl Generator {
                     ParseAction::Shift {
                         state,
                         is_repetition,
+                        ..
                     } => {
                         if is_repetition {
                             add!(self, "SHIFT_REPEAT({})", state);

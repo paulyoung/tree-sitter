@@ -403,8 +403,8 @@ fn report_state_info<'a>(
 
     for (i, state) in parse_table.states.iter().enumerate() {
         all_state_indices.insert(i);
-        let item_set = &parse_state_info[state.id];
-        for (item, _) in item_set.1.entries.iter() {
+        let item_set = &parse_state_info[i];
+        for item in &item_set.1.core.0 {
             if !item.is_augmented() {
                 symbols_with_state_indices[item.variable_index as usize]
                     .1
@@ -446,15 +446,13 @@ fn report_state_info<'a>(
     };
 
     if let Some(state_indices) = state_indices {
-        let mut state_indices = state_indices.into_iter().cloned().collect::<Vec<_>>();
-        state_indices
-            .sort_unstable_by_key(|i| (parse_table.states[*i].unfinished_item_signature, *i));
+        // let mut state_indices = state_indices.into_iter().cloned().collect::<Vec<_>>();
+        // state_indices
+        //     .sort_unstable_by_key(|i| (parse_table.states[*i].unfinished_item_signature, *i));
 
         for state_index in state_indices {
-            let id = parse_table.states[state_index].id;
-            let (preceding_symbols, item_set) = &parse_state_info[id];
+            let (preceding_symbols, item_set) = &parse_state_info[*state_index];
             eprintln!("state index: {}", state_index);
-            eprintln!("state id: {}", id);
             eprint!("symbol sequence:");
             for symbol in preceding_symbols {
                 let name = if symbol.is_terminal() {

@@ -58,7 +58,7 @@ pub(crate) struct ProductionStep {
     pub field_name: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Production {
     pub steps: Vec<ProductionStep>,
     pub dynamic_precedence: i32,

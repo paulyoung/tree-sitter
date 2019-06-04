@@ -240,7 +240,7 @@ impl<'a> ParseItemSetBuilder<'a> {
 
     pub(crate) fn transitive_closure(&mut self, item_set: &ParseItemSet<'a>) -> ParseItemSet<'a> {
         let mut result = ParseItemSet::default();
-        for (item, lookaheads) in &item_set.entries {
+        for (item, lookaheads) in item_set.entries() {
             if let Some(productions) = self
                 .inlines
                 .inlined_productions(item.production, item.step_index)

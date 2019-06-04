@@ -1,4 +1,4 @@
-use super::item::{ParseItem, ParseItemSet, TokenSet};
+use super::item::{ParseItem, ParseItemSet, ParseItemSetContext, ParseItemSetCore, TokenSet};
 use super::item_set_builder::ParseItemSetBuilder;
 use crate::error::{Error, Result};
 use crate::generate::grammars::{
@@ -7,8 +7,8 @@ use crate::generate::grammars::{
 use crate::generate::node_types::VariableInfo;
 use crate::generate::rules::{Associativity, Symbol, SymbolType};
 use crate::generate::tables::{
-    FieldLocation, ParseAction, ParseState, ParseStateId, ParseTable, ParseTableEntry,
-    ProductionInfo, ProductionInfoId,
+    FieldLocation, ParseAction, ParseState, ParseStateContextId, ParseStateId, ParseTable,
+    ParseTableEntry, ProductionInfo, ProductionInfoId,
 };
 use core::ops::Range;
 use hashbrown::hash_map::Entry;
@@ -30,8 +30,10 @@ type AuxiliarySymbolSequence = Vec<AuxiliarySymbolInfo>;
 
 pub(crate) type ParseStateInfo<'a> = (SymbolSequence, ParseItemSet<'a>);
 
-struct ParseStateQueueEntry {
+struct ParseStateQueueEntry<'a> {
     state_id: ParseStateId,
+    context_id: ParseStateContextId,
+    item_set: ParseItemSet<'a>,
     preceding_auxiliary_symbols: AuxiliarySymbolSequence,
 }
 
@@ -40,9 +42,12 @@ struct ParseTableBuilder<'a> {
     syntax_grammar: &'a SyntaxGrammar,
     lexical_grammar: &'a LexicalGrammar,
     variable_info: &'a Vec<VariableInfo>,
-    state_ids_by_item_set: HashMap<ParseItemSet<'a>, ParseStateId>,
-    parse_state_info_by_id: Vec<ParseStateInfo<'a>>,
-    parse_state_queue: VecDeque<ParseStateQueueEntry>,
+    state_ids_by_item_set_core_and_context: HashMap<
+        ParseItemSetCore<'a>,
+        HashMap<ParseItemSetContext, (ParseStateId, ParseStateContextId)>,
+    >,
+    preceding_symbols_by_state_id: Vec<SymbolSequence>,
+    parse_state_queue: VecDeque<ParseStateQueueEntry<'a>>,
     parse_table: ParseTable,
 }
 
@@ -71,21 +76,20 @@ impl<'a> ParseTableBuilder<'a> {
         );
 
         while let Some(entry) = self.parse_state_queue.pop_front() {
-            let item_set = self
-                .item_set_builder
-                .transitive_closure(&self.parse_state_info_by_id[entry.state_id].1);
+            let item_set = self.item_set_builder.transitive_closure(&entry.item_set);
 
             self.add_actions(
-                self.parse_state_info_by_id[entry.state_id].0.clone(),
+                self.preceding_symbols_by_state_id[entry.state_id].clone(),
                 entry.preceding_auxiliary_symbols,
                 entry.state_id,
                 item_set,
             )?;
         }
 
+        self.handle_conflicts();
         self.remove_precedences();
 
-        Ok((self.parse_table, self.parse_state_info_by_id))
+        Ok((self.parse_table, Vec::new()))
     }
 
     fn add_parse_state(
@@ -93,34 +97,61 @@ impl<'a> ParseTableBuilder<'a> {
         preceding_symbols: &SymbolSequence,
         preceding_auxiliary_symbols: &AuxiliarySymbolSequence,
         item_set: ParseItemSet<'a>,
-    ) -> ParseStateId {
-        let mut hasher = DefaultHasher::new();
-        item_set.hash_unfinished_items(&mut hasher);
-        let unfinished_item_signature = hasher.finish();
+    ) -> (ParseStateId, ParseStateContextId) {
+        // Initially, we create an LALR(1) parse table - a parse table with one state
+        // for each distinct parse item set core. But while creating this LALR table,
+        // we store each distinct LR(1) context separately, in case we end up needing
+        // to split up the LALR states due to conflicting contexts.
+        //
+        // For a given core, we store a map of lookahead contexts to parse state ids.
+        // Initially, all of these parse state ids for a given core will be the same,
+        // but they may be changed later if we need to split parse states up by context.
+        let state_ids_by_context = self
+            .state_ids_by_item_set_core_and_context
+            .entry(item_set.core.clone())
+            .or_insert_with(|| HashMap::new());
 
-        match self.state_ids_by_item_set.entry(item_set) {
-            Entry::Occupied(o) => *o.get(),
-            Entry::Vacant(v) => {
-                let state_id = self.parse_table.states.len();
-                self.parse_state_info_by_id
-                    .push((preceding_symbols.clone(), v.key().clone()));
+        let state_count = self.parse_table.states.len();
 
-                self.parse_table.states.push(ParseState {
-                    id: state_id,
-                    lex_state_id: 0,
-                    external_lex_state_id: 0,
-                    terminal_entries: HashMap::new(),
-                    nonterminal_entries: HashMap::new(),
-                    unfinished_item_signature,
-                });
-                self.parse_state_queue.push_back(ParseStateQueueEntry {
-                    state_id,
-                    preceding_auxiliary_symbols: preceding_auxiliary_symbols.clone(),
-                });
-                v.insert(state_id);
-                state_id
+        // Examine the contexts that have already been processed for this parse item set
+        // core, in order to decide what parse state id and context id this context
+        // should be assigned.
+        let mut new_state_id = state_count;
+        let new_context_id = state_ids_by_context.len();
+        for (context, (state_id, context_id)) in state_ids_by_context.iter() {
+            // If the current item set's context has already been processed, then return
+            // the existing context id.
+            if *context == item_set.context {
+                return (*state_id, *context_id);
+            }
+
+            // Contexts that have different external tokens should not be combined into
+            // one parse state, because we cannot tell how those tokens might conflict
+            // with other tokens.
+            if contexts_have_same_externals(context, &item_set.context) {
+                new_state_id = *state_id;
             }
         }
+
+        // If a new parse state is needed, add one.
+        if new_state_id == state_count {
+            self.preceding_symbols_by_state_id
+                .push(preceding_symbols.clone());
+            self.parse_table.states.push(ParseState::default());
+        }
+
+        // Add this new context to the set of contexts for this core,
+        // assign it a new context id, and enqueue this context to be processed.
+        let context = item_set.context.clone();
+        self.parse_state_queue.push_back(ParseStateQueueEntry {
+            state_id: new_state_id,
+            context_id: new_context_id,
+            item_set,
+            preceding_auxiliary_symbols: preceding_auxiliary_symbols.clone(),
+        });
+
+        state_ids_by_context.insert(context, (new_state_id, new_context_id));
+        (new_state_id, new_context_id)
     }
 
     fn add_actions(
@@ -132,9 +163,8 @@ impl<'a> ParseTableBuilder<'a> {
     ) -> Result<()> {
         let mut terminal_successors = HashMap::new();
         let mut non_terminal_successors = HashMap::new();
-        let mut lookaheads_with_conflicts = HashSet::new();
 
-        for (item, lookaheads) in &item_set.entries {
+        for (item, lookaheads) in item_set.entries() {
             if let Some(next_symbol) = item.symbol() {
                 let successor = item.successor();
                 if next_symbol.is_non_terminal() {
@@ -171,19 +201,13 @@ impl<'a> ParseTableBuilder<'a> {
                 };
 
                 for lookahead in lookaheads.iter() {
-                    let entry = self.parse_table.states[state_id]
+                    let actions = &mut self.parse_table.states[state_id]
                         .terminal_entries
-                        .entry(lookahead);
-                    let entry = entry.or_insert_with(|| ParseTableEntry::new());
-                    if entry.actions.is_empty() {
-                        entry.actions.push(action);
-                    } else if action.precedence() > entry.actions[0].precedence() {
-                        entry.actions.clear();
-                        entry.actions.push(action);
-                        lookaheads_with_conflicts.remove(&lookahead);
-                    } else if action.precedence() == entry.actions[0].precedence() {
-                        entry.actions.push(action);
-                        lookaheads_with_conflicts.insert(lookahead);
+                        .entry(lookahead)
+                        .or_insert_with(|| ParseTableEntry::new())
+                        .actions;
+                    if !actions.contains(&action) {
+                        actions.push(action);
                     }
                 }
             }
@@ -191,29 +215,26 @@ impl<'a> ParseTableBuilder<'a> {
 
         for (symbol, next_item_set) in terminal_successors {
             preceding_symbols.push(symbol);
-            let next_state_id = self.add_parse_state(
+            let (next_state_id, next_state_context_id) = self.add_parse_state(
                 &preceding_symbols,
                 &preceding_auxiliary_symbols,
                 next_item_set,
             );
             preceding_symbols.pop();
 
-            let entry = self.parse_table.states[state_id]
+            let action = ParseAction::Shift {
+                state: next_state_id,
+                context: next_state_context_id,
+                is_repetition: false,
+            };
+            let actions = &mut self.parse_table.states[state_id]
                 .terminal_entries
-                .entry(symbol);
-            if let Entry::Occupied(e) = &entry {
-                if !e.get().actions.is_empty() {
-                    lookaheads_with_conflicts.insert(symbol);
-                }
-            }
-
-            entry
+                .entry(symbol)
                 .or_insert_with(|| ParseTableEntry::new())
-                .actions
-                .push(ParseAction::Shift {
-                    state: next_state_id,
-                    is_repetition: false,
-                });
+                .actions;
+            if !actions.iter().any(|a| a.is_shift()) {
+                actions.push(action);
+            }
         }
 
         for (symbol, next_item_set) in non_terminal_successors {
@@ -229,16 +250,6 @@ impl<'a> ParseTableBuilder<'a> {
                 .insert(symbol, next_state_id);
         }
 
-        for symbol in lookaheads_with_conflicts {
-            self.handle_conflict(
-                &item_set,
-                state_id,
-                &preceding_symbols,
-                &preceding_auxiliary_symbols,
-                symbol,
-            )?;
-        }
-
         let state = &mut self.parse_table.states[state_id];
         for extra_token in &self.syntax_grammar.extra_tokens {
             state
@@ -251,6 +262,10 @@ impl<'a> ParseTableBuilder<'a> {
         }
 
         Ok(())
+    }
+
+    fn handle_conflicts(&mut self) {
+        for (item_set_core, state_ids_by_context) in &self.state_ids_by_item_set_core_and_context {}
     }
 
     fn handle_conflict(
@@ -276,7 +291,7 @@ impl<'a> ParseTableBuilder<'a> {
         let mut considered_associativity = false;
         let mut shift_precedence: Option<Range<i32>> = None;
         let mut conflicting_items = HashSet::new();
-        for (item, lookaheads) in &item_set.entries {
+        for (item, lookaheads) in item_set.entries() {
             if let Some(step) = item.step() {
                 if item.step_index > 0 {
                     if self
@@ -597,9 +612,10 @@ impl<'a> ParseTableBuilder<'a> {
         symbol: Symbol,
     ) -> AuxiliarySymbolInfo {
         let parent_symbols = item_set
-            .entries
+            .core
+            .0
             .iter()
-            .filter_map(|(item, _)| {
+            .filter_map(|item| {
                 let variable_index = item.variable_index as usize;
                 if item.symbol() == Some(symbol)
                     && !self.syntax_grammar.variables[variable_index].is_auxiliary()
@@ -714,6 +730,18 @@ impl<'a> ParseTableBuilder<'a> {
     }
 }
 
+fn contexts_have_same_externals(left: &ParseItemSetContext, right: &ParseItemSetContext) -> bool {
+    let mut left_externals = TokenSet::new();
+    let mut right_externals = TokenSet::new();
+    for set in &left.0 {
+        left_externals.insert_all_externals(set);
+    }
+    for set in &right.0 {
+        right_externals.insert_all_externals(set);
+    }
+    left_externals == right_externals
+}
+
 fn populate_following_tokens(
     result: &mut Vec<TokenSet>,
     grammar: &SyntaxGrammar,
@@ -758,8 +786,8 @@ pub(crate) fn build_parse_table<'a>(
         lexical_grammar,
         item_set_builder,
         variable_info,
-        state_ids_by_item_set: HashMap::new(),
-        parse_state_info_by_id: Vec::new(),
+        state_ids_by_item_set_core_and_context: HashMap::new(),
+        preceding_symbols_by_state_id: Vec::new(),
         parse_state_queue: VecDeque::new(),
         parse_table: ParseTable {
             states: Vec::new(),

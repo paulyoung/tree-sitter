@@ -15,19 +15,19 @@ pub(crate) fn minimize_parse_table(
     token_conflict_map: &TokenConflictMap,
     keywords: &TokenSet,
 ) {
-    let mut minimizer = Minimizer {
-        parse_table,
-        syntax_grammar,
-        lexical_grammar,
-        token_conflict_map,
-        keywords,
-        simple_aliases,
-    };
-    minimizer.remove_unit_reductions();
-    minimizer.remove_unused_states();
-    minimizer.merge_compatible_states();
-    minimizer.remove_unused_states();
-    minimizer.reorder_states_by_descending_size();
+    // let mut minimizer = Minimizer {
+    //     parse_table,
+    //     syntax_grammar,
+    //     lexical_grammar,
+    //     token_conflict_map,
+    //     keywords,
+    //     simple_aliases,
+    // };
+    // minimizer.remove_unit_reductions();
+    // minimizer.remove_unused_states();
+    // minimizer.merge_compatible_states();
+    // minimizer.remove_unused_states();
+    // minimizer.reorder_states_by_descending_size();
 }
 
 struct Minimizer<'a> {
@@ -40,192 +40,192 @@ struct Minimizer<'a> {
 }
 
 impl<'a> Minimizer<'a> {
-    fn remove_unit_reductions(&mut self) {
-        let mut aliased_symbols = HashSet::new();
-        for variable in &self.syntax_grammar.variables {
-            for production in &variable.productions {
-                for step in &production.steps {
-                    if step.alias.is_some() {
-                        aliased_symbols.insert(step.symbol);
-                    }
-                }
-            }
-        }
-
-        let mut unit_reduction_symbols_by_state = HashMap::new();
-        for (i, state) in self.parse_table.states.iter().enumerate() {
-            let mut only_unit_reductions = true;
-            let mut unit_reduction_symbol = None;
-            for (_, entry) in &state.terminal_entries {
-                for action in &entry.actions {
-                    match action {
-                        ParseAction::ShiftExtra => continue,
-                        ParseAction::Reduce {
-                            child_count: 1,
-                            production_id: 0,
-                            symbol,
-                            ..
-                        } => {
-                            if !self.simple_aliases.contains_key(&symbol)
-                                && !aliased_symbols.contains(&symbol)
-                                && self.syntax_grammar.variables[symbol.index].kind
-                                    != VariableType::Named
-                                && (unit_reduction_symbol.is_none()
-                                    || unit_reduction_symbol == Some(symbol))
-                            {
-                                unit_reduction_symbol = Some(symbol);
-                                continue;
-                            }
-                        }
-                        _ => {}
-                    }
-                    only_unit_reductions = false;
-                    break;
-                }
-
-                if !only_unit_reductions {
-                    break;
-                }
-            }
-
-            if let Some(symbol) = unit_reduction_symbol {
-                if only_unit_reductions {
-                    unit_reduction_symbols_by_state.insert(i, *symbol);
-                }
-            }
-        }
-
-        for state in self.parse_table.states.iter_mut() {
-            let mut done = false;
-            while !done {
-                done = true;
-                state.update_referenced_states(|other_state_id, state| {
-                    if let Some(symbol) = unit_reduction_symbols_by_state.get(&other_state_id) {
-                        done = false;
-                        state.nonterminal_entries[symbol]
-                    } else {
-                        other_state_id
-                    }
-                })
-            }
-        }
-    }
-
-    fn merge_compatible_states(&mut self) {
-        let mut state_ids_by_signature = HashMap::new();
-        for (i, state) in self.parse_table.states.iter().enumerate() {
-            state_ids_by_signature
-                .entry(state.unfinished_item_signature)
-                .or_insert(Vec::new())
-                .push(i);
-        }
-
-        let mut deleted_states = HashSet::new();
-        loop {
-            let mut state_replacements = HashMap::new();
-            for (_, state_ids) in &state_ids_by_signature {
-                for i in state_ids {
-                    for j in state_ids {
-                        if j == i {
-                            break;
-                        }
-                        if deleted_states.contains(j) || deleted_states.contains(i) {
-                            continue;
-                        }
-                        if self.merge_parse_state(*j, *i) {
-                            deleted_states.insert(*i);
-                            state_replacements.insert(*i, *j);
-                        }
-                    }
-                }
-            }
-
-            if state_replacements.is_empty() {
-                break;
-            }
-
-            for state in self.parse_table.states.iter_mut() {
-                state.update_referenced_states(|other_state_id, _| {
-                    *state_replacements
-                        .get(&other_state_id)
-                        .unwrap_or(&other_state_id)
-                });
-            }
-        }
-    }
-
-    fn merge_parse_state(&mut self, left: usize, right: usize) -> bool {
-        let left_state = &self.parse_table.states[left];
-        let right_state = &self.parse_table.states[right];
-
-        let left_id = left_state.id;
-        let right_id = right_state.id;
-
-        if left_state.nonterminal_entries != right_state.nonterminal_entries {
-            info!(
-                "cannot merge {} {} because of differing non-terminals",
-                left_id, right_id,
-            );
-            return false;
-        }
-
-        for (symbol, left_entry) in &left_state.terminal_entries {
-            if let Some(right_entry) = right_state.terminal_entries.get(symbol) {
-                if right_entry.actions != left_entry.actions {
-                    info!(
-                        "cannot merge {} {} because of different actions for terminal {:?}: {:?}, {:?}",
-                        left_id,
-                        right_id,
-                        if symbol.is_external() {
-                            &self.syntax_grammar.external_tokens[symbol.index].name
-                        } else {
-                            &self.lexical_grammar.variables[symbol.index].name
-                        },
-                        ActionsDisplay(
-                            &left_entry.actions,
-                            &self.parse_table,
-                            &self.syntax_grammar
-                        ),
-                        ActionsDisplay(
-                            &right_entry.actions,
-                            &self.parse_table,
-                            &self.syntax_grammar
-                        ),
-                    );
-                    return false;
-                }
-            } else if !self.can_add_entry_to_state(
-                left_id,
-                right_id,
-                right_state,
-                *symbol,
-                left_entry,
-            ) {
-                return false;
-            }
-        }
-
-        let mut symbols_to_add = Vec::new();
-        for (symbol, right_entry) in &right_state.terminal_entries {
-            if !left_state.terminal_entries.contains_key(&symbol) {
-                if !self.can_add_entry_to_state(left_id, right_id, left_state, *symbol, right_entry)
-                {
-                    return false;
-                }
-                symbols_to_add.push(*symbol);
-            }
-        }
-
-        for symbol in symbols_to_add {
-            let entry = self.parse_table.states[right].terminal_entries[&symbol].clone();
-            self.parse_table.states[left]
-                .terminal_entries
-                .insert(symbol, entry);
-        }
-
-        info!("merged {} {}", left_id, right_id);
-        true
-    }
+    // fn remove_unit_reductions(&mut self) {
+    //     let mut aliased_symbols = HashSet::new();
+    //     for variable in &self.syntax_grammar.variables {
+    //         for production in &variable.productions {
+    //             for step in &production.steps {
+    //                 if step.alias.is_some() {
+    //                     aliased_symbols.insert(step.symbol);
+    //                 }
+    //             }
+    //         }
+    //     }
+    //
+    //     let mut unit_reduction_symbols_by_state = HashMap::new();
+    //     for (i, state) in self.parse_table.states.iter().enumerate() {
+    //         let mut only_unit_reductions = true;
+    //         let mut unit_reduction_symbol = None;
+    //         for (_, entry) in &state.terminal_entries {
+    //             for action in &entry.actions {
+    //                 match action {
+    //                     ParseAction::ShiftExtra => continue,
+    //                     ParseAction::Reduce {
+    //                         child_count: 1,
+    //                         production_id: 0,
+    //                         symbol,
+    //                         ..
+    //                     } => {
+    //                         if !self.simple_aliases.contains_key(&symbol)
+    //                             && !aliased_symbols.contains(&symbol)
+    //                             && self.syntax_grammar.variables[symbol.index].kind
+    //                                 != VariableType::Named
+    //                             && (unit_reduction_symbol.is_none()
+    //                                 || unit_reduction_symbol == Some(symbol))
+    //                         {
+    //                             unit_reduction_symbol = Some(symbol);
+    //                             continue;
+    //                         }
+    //                     }
+    //                     _ => {}
+    //                 }
+    //                 only_unit_reductions = false;
+    //                 break;
+    //             }
+    //
+    //             if !only_unit_reductions {
+    //                 break;
+    //             }
+    //         }
+    //
+    //         if let Some(symbol) = unit_reduction_symbol {
+    //             if only_unit_reductions {
+    //                 unit_reduction_symbols_by_state.insert(i, *symbol);
+    //             }
+    //         }
+    //     }
+    //
+    //     for state in self.parse_table.states.iter_mut() {
+    //         let mut done = false;
+    //         while !done {
+    //             done = true;
+    //             state.update_referenced_states(|other_state_id, state| {
+    //                 if let Some(symbol) = unit_reduction_symbols_by_state.get(&other_state_id) {
+    //                     done = false;
+    //                     state.nonterminal_entries[symbol]
+    //                 } else {
+    //                     other_state_id
+    //                 }
+    //             })
+    //         }
+    //     }
+    // }
+    //
+    // fn merge_compatible_states(&mut self) {
+    //     let mut state_ids_by_signature = HashMap::new();
+    //     for (i, state) in self.parse_table.states.iter().enumerate() {
+    //         state_ids_by_signature
+    //             .entry(state.unfinished_item_signature)
+    //             .or_insert(Vec::new())
+    //             .push(i);
+    //     }
+    //
+    //     let mut deleted_states = HashSet::new();
+    //     loop {
+    //         let mut state_replacements = HashMap::new();
+    //         for (_, state_ids) in &state_ids_by_signature {
+    //             for i in state_ids {
+    //                 for j in state_ids {
+    //                     if j == i {
+    //                         break;
+    //                     }
+    //                     if deleted_states.contains(j) || deleted_states.contains(i) {
+    //                         continue;
+    //                     }
+    //                     if self.merge_parse_state(*j, *i) {
+    //                         deleted_states.insert(*i);
+    //                         state_replacements.insert(*i, *j);
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //
+    //         if state_replacements.is_empty() {
+    //             break;
+    //         }
+    //
+    //         for state in self.parse_table.states.iter_mut() {
+    //             state.update_referenced_states(|other_state_id, _| {
+    //                 *state_replacements
+    //                     .get(&other_state_id)
+    //                     .unwrap_or(&other_state_id)
+    //             });
+    //         }
+    //     }
+    // }
+    //
+    // fn merge_parse_state(&mut self, left: usize, right: usize) -> bool {
+    //     let left_state = &self.parse_table.states[left];
+    //     let right_state = &self.parse_table.states[right];
+    //
+    //     let left_id = left_state.id;
+    //     let right_id = right_state.id;
+    //
+    //     if left_state.nonterminal_entries != right_state.nonterminal_entries {
+    //         info!(
+    //             "cannot merge {} {} because of differing non-terminals",
+    //             left_id, right_id,
+    //         );
+    //         return false;
+    //     }
+    //
+    //     for (symbol, left_entry) in &left_state.terminal_entries {
+    //         if let Some(right_entry) = right_state.terminal_entries.get(symbol) {
+    //             if right_entry.actions != left_entry.actions {
+    //                 info!(
+    //                     "cannot merge {} {} because of different actions for terminal {:?}: {:?}, {:?}",
+    //                     left_id,
+    //                     right_id,
+    //                     if symbol.is_external() {
+    //                         &self.syntax_grammar.external_tokens[symbol.index].name
+    //                     } else {
+    //                         &self.lexical_grammar.variables[symbol.index].name
+    //                     },
+    //                     ActionsDisplay(
+    //                         &left_entry.actions,
+    //                         &self.parse_table,
+    //                         &self.syntax_grammar
+    //                     ),
+    //                     ActionsDisplay(
+    //                         &right_entry.actions,
+    //                         &self.parse_table,
+    //                         &self.syntax_grammar
+    //                     ),
+    //                 );
+    //                 return false;
+    //             }
+    //         } else if !self.can_add_entry_to_state(
+    //             left_id,
+    //             right_id,
+    //             right_state,
+    //             *symbol,
+    //             left_entry,
+    //         ) {
+    //             return false;
+    //         }
+    //     }
+    //
+    //     let mut symbols_to_add = Vec::new();
+    //     for (symbol, right_entry) in &right_state.terminal_entries {
+    //         if !left_state.terminal_entries.contains_key(&symbol) {
+    //             if !self.can_add_entry_to_state(left_id, right_id, left_state, *symbol, right_entry)
+    //             {
+    //                 return false;
+    //             }
+    //             symbols_to_add.push(*symbol);
+    //         }
+    //     }
+    //
+    //     for symbol in symbols_to_add {
+    //         let entry = self.parse_table.states[right].terminal_entries[&symbol].clone();
+    //         self.parse_table.states[left]
+    //             .terminal_entries
+    //             .insert(symbol, entry);
+    //     }
+    //
+    //     info!("merged {} {}", left_id, right_id);
+    //     true
+    // }
 
     fn can_add_entry_to_state(
         &self,
@@ -322,73 +322,73 @@ impl<'a> Minimizer<'a> {
 
         true
     }
+    //
+    // fn remove_unused_states(&mut self) {
+    //     let mut state_usage_map = vec![false; self.parse_table.states.len()];
+    //
+    //     state_usage_map[0] = true;
+    //     state_usage_map[1] = true;
+    //
+    //     for state in &self.parse_table.states {
+    //         for referenced_state in state.referenced_states() {
+    //             state_usage_map[referenced_state] = true;
+    //         }
+    //     }
+    //     let mut removed_predecessor_count = 0;
+    //     let mut state_replacement_map = vec![0; self.parse_table.states.len()];
+    //     for state_id in 0..self.parse_table.states.len() {
+    //         state_replacement_map[state_id] = state_id - removed_predecessor_count;
+    //         if !state_usage_map[state_id] {
+    //             removed_predecessor_count += 1;
+    //         }
+    //     }
+    //     let mut state_id = 0;
+    //     let mut original_state_id = 0;
+    //     while state_id < self.parse_table.states.len() {
+    //         if state_usage_map[original_state_id] {
+    //             self.parse_table.states[state_id].update_referenced_states(|other_state_id, _| {
+    //                 state_replacement_map[other_state_id]
+    //             });
+    //             state_id += 1;
+    //         } else {
+    //             self.parse_table.states.remove(state_id);
+    //         }
+    //         original_state_id += 1;
+    //     }
+    // }
 
-    fn remove_unused_states(&mut self) {
-        let mut state_usage_map = vec![false; self.parse_table.states.len()];
-
-        state_usage_map[0] = true;
-        state_usage_map[1] = true;
-
-        for state in &self.parse_table.states {
-            for referenced_state in state.referenced_states() {
-                state_usage_map[referenced_state] = true;
-            }
-        }
-        let mut removed_predecessor_count = 0;
-        let mut state_replacement_map = vec![0; self.parse_table.states.len()];
-        for state_id in 0..self.parse_table.states.len() {
-            state_replacement_map[state_id] = state_id - removed_predecessor_count;
-            if !state_usage_map[state_id] {
-                removed_predecessor_count += 1;
-            }
-        }
-        let mut state_id = 0;
-        let mut original_state_id = 0;
-        while state_id < self.parse_table.states.len() {
-            if state_usage_map[original_state_id] {
-                self.parse_table.states[state_id].update_referenced_states(|other_state_id, _| {
-                    state_replacement_map[other_state_id]
-                });
-                state_id += 1;
-            } else {
-                self.parse_table.states.remove(state_id);
-            }
-            original_state_id += 1;
-        }
-    }
-
-    fn reorder_states_by_descending_size(&mut self) {
-        // Get a mapping of old state index -> new_state_index
-        let mut old_ids_by_new_id = (0..self.parse_table.states.len()).collect::<Vec<_>>();
-        &old_ids_by_new_id.sort_unstable_by_key(|i| {
-            // Don't changes states 0 (the error state) or 1 (the start state).
-            if *i <= 1 {
-                return *i as i64 - 1_000_000;
-            }
-
-            // Reorder all the other states by descending symbol count.
-            let state = &self.parse_table.states[*i];
-            -((state.terminal_entries.len() + state.nonterminal_entries.len()) as i64)
-        });
-
-        // Get the inverse mapping
-        let mut new_ids_by_old_id = vec![0; old_ids_by_new_id.len()];
-        for (id, old_id) in old_ids_by_new_id.iter().enumerate() {
-            new_ids_by_old_id[*old_id] = id;
-        }
-
-        // Reorder the parse states and update their references to reflect
-        // the new ordering.
-        self.parse_table.states = old_ids_by_new_id
-            .iter()
-            .map(|old_id| {
-                let mut state = ParseState::default();
-                mem::swap(&mut state, &mut self.parse_table.states[*old_id]);
-                state.update_referenced_states(|id, _| new_ids_by_old_id[id]);
-                state
-            })
-            .collect();
-    }
+    // fn reorder_states_by_descending_size(&mut self) {
+    //     // Get a mapping of old state index -> new_state_index
+    //     let mut old_ids_by_new_id = (0..self.parse_table.states.len()).collect::<Vec<_>>();
+    //     &old_ids_by_new_id.sort_unstable_by_key(|i| {
+    //         // Don't changes states 0 (the error state) or 1 (the start state).
+    //         if *i <= 1 {
+    //             return *i as i64 - 1_000_000;
+    //         }
+    //
+    //         // Reorder all the other states by descending symbol count.
+    //         let state = &self.parse_table.states[*i];
+    //         -((state.terminal_entries.len() + state.nonterminal_entries.len()) as i64)
+    //     });
+    //
+    //     // Get the inverse mapping
+    //     let mut new_ids_by_old_id = vec![0; old_ids_by_new_id.len()];
+    //     for (id, old_id) in old_ids_by_new_id.iter().enumerate() {
+    //         new_ids_by_old_id[*old_id] = id;
+    //     }
+    //
+    //     // Reorder the parse states and update their references to reflect
+    //     // the new ordering.
+    //     self.parse_table.states = old_ids_by_new_id
+    //         .iter()
+    //         .map(|old_id| {
+    //             let mut state = ParseState::default();
+    //             mem::swap(&mut state, &mut self.parse_table.states[*old_id]);
+    //             state.update_referenced_states(|id, _| new_ids_by_old_id[id]);
+    //             state
+    //         })
+    //         .collect();
+    // }
 }
 
 struct ActionsDisplay<'a>(&'a Vec<ParseAction>, &'a ParseTable, &'a SyntaxGrammar);
@@ -400,17 +400,17 @@ impl<'a> fmt::Debug for ActionsDisplay<'a> {
             if i > 0 {
                 write!(f, ", ")?;
             }
-            match action {
-                ParseAction::Shift { state, .. } => {
-                    write!(f, "Shift({})", self.1.states[*state].id)?;
-                }
-                ParseAction::Reduce { symbol, .. } => {
-                    write!(f, "Reduce({})", self.2.variables[symbol.index].name)?;
-                }
-                _ => {
-                    write!(f, "{:?}", action)?;
-                }
-            }
+            // match action {
+            //     ParseAction::Shift { state, .. } => {
+            //         write!(f, "Shift({})", self.1.states[*state].id)?;
+            //     }
+            //     ParseAction::Reduce { symbol, .. } => {
+            //         write!(f, "Reduce({})", self.2.variables[symbol.index].name)?;
+            //     }
+            //     _ => {
+            //         write!(f, "{:?}", action)?;
+            //     }
+            // }
         }
         write!(f, "]")?;
         Ok(())

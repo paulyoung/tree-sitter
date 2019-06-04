@@ -1,6 +1,4 @@
-use crate::generate::grammars::{
-    LexicalGrammar, Production, ProductionStep, SyntaxGrammar,
-};
+use crate::generate::grammars::{LexicalGrammar, Production, ProductionStep, SyntaxGrammar};
 use crate::generate::rules::Associativity;
 use crate::generate::rules::{Symbol, SymbolType};
 use lazy_static::lazy_static;
@@ -45,9 +43,16 @@ pub(crate) struct ParseItem<'a> {
     pub production: &'a Production,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct ParseItemSetCore<'a>(pub Vec<ParseItem<'a>>);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct ParseItemSetContext(pub Vec<TokenSet>);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ParseItemSet<'a> {
-    pub entries: Vec<(ParseItem<'a>, TokenSet)>,
+    pub core: ParseItemSetCore<'a>,
+    pub context: ParseItemSetContext,
 }
 
 pub(crate) struct ParseItemDisplay<'a>(
@@ -160,7 +165,7 @@ impl TokenSet {
         result
     }
 
-    fn insert_all_externals(&mut self, other: &TokenSet) -> bool {
+    pub fn insert_all_externals(&mut self, other: &TokenSet) -> bool {
         let mut result = false;
         if other.external_bits.len() > self.external_bits.len() {
             self.external_bits.resize(other.external_bits.len(), false);
@@ -256,22 +261,31 @@ impl<'a> ParseItemSet<'a> {
     }
 
     pub fn insert(&mut self, item: ParseItem<'a>, lookaheads: &TokenSet) -> &mut TokenSet {
-        match self.entries.binary_search_by(|(i, _)| i.cmp(&item)) {
+        match self.core.0.binary_search_by(|i| i.cmp(&item)) {
             Err(i) => {
-                self.entries.insert(i, (item, lookaheads.clone()));
-                &mut self.entries[i].1
+                self.core.0.insert(i, item);
+                self.context.0.insert(i, lookaheads.clone());
+                &mut self.context.0[i]
             }
             Ok(i) => {
-                self.entries[i].1.insert_all(lookaheads);
-                &mut self.entries[i].1
+                self.context.0[i].insert_all(lookaheads);
+                &mut self.context.0[i]
             }
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.core.0.len()
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = (&ParseItem<'a>, &TokenSet)> {
+        self.core.0.iter().zip(self.context.0.iter())
     }
 
     pub fn hash_unfinished_items(&self, h: &mut impl Hasher) {
         let mut previous_variable_index = u32::MAX;
         let mut previous_step_index = u32::MAX;
-        for (item, _) in self.entries.iter() {
+        for item in self.core.0.iter() {
             if item.step().is_some()
                 && (item.variable_index != previous_variable_index
                     || item.step_index != previous_step_index)
@@ -281,14 +295,6 @@ impl<'a> ParseItemSet<'a> {
                 previous_variable_index = item.variable_index;
                 previous_step_index = item.step_index;
             }
-        }
-    }
-}
-
-impl<'a> Default for ParseItemSet<'a> {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
         }
     }
 }
@@ -384,7 +390,7 @@ impl<'a> fmt::Display for TokenSetDisplay<'a> {
 
 impl<'a> fmt::Display for ParseItemSetDisplay<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        for (item, lookaheads) in self.0.entries.iter() {
+        for (item, lookaheads) in self.0.entries() {
             writeln!(
                 f,
                 "{}\t{}",
@@ -506,8 +512,8 @@ impl<'a> Eq for ParseItem<'a> {}
 
 impl<'a> Hash for ParseItemSet<'a> {
     fn hash<H: Hasher>(&self, hasher: &mut H) {
-        hasher.write_usize(self.entries.len());
-        for (item, lookaheads) in self.entries.iter() {
+        hasher.write_usize(self.len());
+        for (item, lookaheads) in self.entries() {
             item.hash(hasher);
             lookaheads.hash(hasher);
         }

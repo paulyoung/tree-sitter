@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 pub(crate) type ProductionInfoId = usize;
 pub(crate) type ParseStateId = usize;
+pub(crate) type ParseStateContextId = usize;
 pub(crate) type LexStateId = usize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,6 +13,7 @@ pub(crate) enum ParseAction {
     Accept,
     Shift {
         state: ParseStateId,
+        context: ParseStateContextId,
         is_repetition: bool,
     },
     ShiftExtra,
@@ -34,12 +36,10 @@ pub(crate) struct ParseTableEntry {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ParseState {
-    pub id: usize,
     pub terminal_entries: HashMap<Symbol, ParseTableEntry>,
-    pub nonterminal_entries: HashMap<Symbol, ParseStateId>,
+    pub nonterminal_entries: HashMap<Symbol, (ParseStateId, ParseStateContextId)>,
     pub lex_state_id: usize,
     pub external_lex_state_id: usize,
-    pub unfinished_item_signature: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -109,38 +109,48 @@ impl ParseState {
                     _ => None,
                 })
             })
-            .chain(self.nonterminal_entries.iter().map(|(_, state)| *state))
+            .chain(
+                self.nonterminal_entries
+                    .iter()
+                    .map(|(_, (state, _))| *state),
+            )
     }
 
     pub fn update_referenced_states<F>(&mut self, mut f: F)
     where
-        F: FnMut(usize, &ParseState) -> usize,
+        F: FnMut(
+            ParseStateId,
+            ParseStateContextId,
+            &ParseState,
+        ) -> (ParseStateId, ParseStateContextId),
     {
         let mut updates = Vec::new();
         for (symbol, entry) in &self.terminal_entries {
             for (i, action) in entry.actions.iter().enumerate() {
-                if let ParseAction::Shift { state, .. } = action {
-                    let result = f(*state, self);
-                    if result != *state {
-                        updates.push((*symbol, i, result));
+                if let ParseAction::Shift { state, context, .. } = action {
+                    let (new_state, new_context) = f(*state, *context, self);
+                    if new_state != *state || new_context != *context {
+                        updates.push((*symbol, i, new_state, new_context));
                     }
                 }
             }
         }
-        for (symbol, other_state) in &self.nonterminal_entries {
-            let result = f(*other_state, self);
-            if result != *other_state {
-                updates.push((*symbol, 0, result));
+        for (symbol, (other_state, other_context)) in &self.nonterminal_entries {
+            let (new_state, new_context) = f(*other_state, *other_context, self);
+            if new_state != *other_state || new_context != *other_context {
+                updates.push((*symbol, 0, new_state, new_context));
             }
         }
-        for (symbol, action_index, new_state) in updates {
+        for (symbol, action_index, new_state, new_context) in updates {
             if symbol.is_non_terminal() {
-                self.nonterminal_entries.insert(symbol, new_state);
+                self.nonterminal_entries
+                    .insert(symbol, (new_state, new_context));
             } else {
                 let entry = self.terminal_entries.get_mut(&symbol).unwrap();
                 if let ParseAction::Shift { is_repetition, .. } = entry.actions[action_index] {
                     entry.actions[action_index] = ParseAction::Shift {
                         state: new_state,
+                        context: new_context,
                         is_repetition,
                     };
                 }
@@ -150,6 +160,14 @@ impl ParseState {
 }
 
 impl ParseAction {
+    pub fn is_shift(&self) -> bool {
+        if let ParseAction::Shift { .. } = self {
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn precedence(&self) -> i32 {
         if let ParseAction::Reduce { precedence, .. } = self {
             *precedence
